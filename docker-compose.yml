@@ -1,0 +1,112 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:16-3.4-alpine
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_DB_NAME: ${POSTGRES_DB}
+      APP_DB_USER: ${POSTGRES_USER}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env
+    environment:
+      # The local nginx endpoint is HTTP; production deployments should set
+      # SECURE_SSL_REDIRECT=true in their environment behind HTTPS.
+      SECURE_SSL_REDIRECT: "false"
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=2).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  billing_scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "manage.py", "send_monthly_billing_invoices", "--loop"]
+    env_file:
+      - .env
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    volumes:
+      - frontend_build:/output
+    # Always wipe and re-copy the fresh build into the shared volume on every start,
+    # since Docker only auto-populates an empty named volume the first time it's created.
+    command: sh -c "rm -rf /output/* && cp -r /app/dist/* /output/"
+    restart: "no"
+
+  nginx:
+    build:
+      context: ./nginx
+    ports:
+      - "8082:80"
+    networks:
+      - default
+      - shared_proxy_network
+    volumes:
+      - static_volume:/usr/share/nginx/static:ro
+      - media_volume:/usr/share/nginx/media:ro
+      - frontend_build:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+  frontend_build:
+
+networks:
+  default:
+  shared_proxy_network:
+    external: true
